@@ -84,8 +84,8 @@ ALLOWED_USERS=123456789
 ### 4. Run
 
 ```bash
-make run          # Production
-make run-debug    # With debug logging
+uv run claude-telegram-bot          # Production
+DEBUG=true uv run claude-telegram-bot  # With debug logging
 ```
 
 Message your bot on Telegram to get started.
@@ -332,11 +332,11 @@ See [SECURITY.md](SECURITY.md) for details.
 ## Development
 
 ```bash
-make dev           # Install all dependencies
-make test          # Run tests with coverage
-make lint          # Black + isort + flake8 + mypy
-make format        # Auto-format code
-make run-debug     # Run with debug logging
+uv sync                    # Install all dependencies
+uv run pytest              # Run tests
+uv run black src tests     # Format code
+uv run flake8 src tests    # Lint
+DEBUG=true uv run claude-telegram-bot  # Run with debug logging
 ```
 
 > **Full documentation:** See the [docs index](docs/README.md) for all guides and references.
