@@ -34,7 +34,7 @@ def load_config(
     env_file = config_file or Path(".env")
     if env_file.exists():
         logger.info("Loading .env file", path=str(env_file))
-        load_dotenv(env_file)
+        load_dotenv(env_file, override=False, encoding="utf-8-sig")
     else:
         logger.warning("No .env file found", path=str(env_file))
 
