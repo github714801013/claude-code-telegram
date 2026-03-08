@@ -93,8 +93,12 @@ class VoiceHandler:
         )
 
         # Build prompt
-        label = caption if caption else "Voice message transcription:"
-        prompt = f"{label}\n\n{transcription}"
+        if caption:
+            # 有附加文字时：caption 作为指令，转录文本作为内容
+            prompt = f"{caption}\n\n[语音转录内容]: {transcription}"
+        else:
+            # 无附加文字时：直接把转录文本作为用户的指令/消息
+            prompt = transcription
 
         dur = voice.duration
         duration_secs = int(dur.total_seconds()) if isinstance(dur, timedelta) else dur

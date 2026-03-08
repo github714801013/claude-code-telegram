@@ -1515,8 +1515,10 @@ class MessageOrchestrator:
 
         try:
             voice = update.message.voice
+            caption = update.message.caption
+
             processed_voice = await voice_handler.process_voice_message(
-                voice, update.message.caption
+                voice, caption
             )
 
             await progress_msg.edit_text("Working...")
@@ -1527,6 +1529,7 @@ class MessageOrchestrator:
                 progress_msg=progress_msg,
                 user_id=user_id,
                 chat=chat,
+                fallback_text=f"🎙️ <b>语音转录结果：</b>\n\n{escape_html(processed_voice.transcription)}",
             )
 
         except Exception as e:
@@ -1546,6 +1549,7 @@ class MessageOrchestrator:
         progress_msg: Any,
         user_id: int,
         chat: Any,
+        fallback_text: Optional[str] = None,
     ) -> None:
         """Run a media-derived prompt through Claude and send responses."""
         claude_integration = context.bot_data.get("claude_integration")
@@ -1600,7 +1604,26 @@ class MessageOrchestrator:
         from .utils.formatting import ResponseFormatter
 
         formatter = ResponseFormatter(self.settings)
-        formatted_messages = formatter.format_claude_response(claude_response.content)
+        response_text = claude_response.content
+        if not response_text or not str(response_text).strip():
+            if tool_log:
+                # Claude 只执行了工具但未返回文字，生成工具摘要
+                lines = ["<b>✅ 已执行以下操作：</b>"]
+                for entry in tool_log:
+                    if entry.get("kind") == "tool":
+                        icon = _tool_icon(entry["name"])
+                        detail = entry.get("detail", "")
+                        if detail:
+                            lines.append(f"{icon} <code>{escape_html(entry['name'])}({escape_html(detail)})</code>")
+                        else:
+                            lines.append(f"{icon} <code>{escape_html(entry['name'])}</code>")
+                    elif entry.get("kind") == "text":
+                        lines.append(f"💬 {escape_html(entry.get('detail', ''))}")
+                response_text = "\n".join(lines)
+            elif fallback_text:
+                # Claude 既没有返回文字也没有调用工具，使用兜底文本（如语音转录原文）
+                response_text = fallback_text
+        formatted_messages = formatter.format_claude_response(response_text)
 
         try:
             await progress_msg.delete()
