@@ -81,6 +81,8 @@ class VoiceHandler:
 
         if self.config.voice_provider == "openai":
             transcription = await self._transcribe_openai(voice_bytes)
+        elif self.config.voice_provider == "custom":
+            transcription = await self._transcribe_custom(voice_bytes)
         else:
             transcription = await self._transcribe_mistral(voice_bytes)
 
@@ -146,6 +148,50 @@ class VoiceHandler:
 
         self._mistral_client = Mistral(api_key=api_key)
         return self._mistral_client
+
+    async def _transcribe_custom(self, voice_bytes: bytes) -> str:
+        """Transcribe audio using a custom HTTP provider (e.g., Xinference)."""
+        if not self.config.custom_voice_url:
+            raise RuntimeError("CUSTOM_VOICE_URL is not configured for custom voice provider.")
+            
+        try:
+            import httpx
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Optional dependency 'httpx' is missing for custom voice transcription. "
+                "Install it with: pip install httpx"
+            ) from exc
+
+        headers = {}
+        if self.config.custom_voice_api_key:
+            api_key = self.config.custom_voice_api_key.get_secret_value()
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        data = {"model": self.config.resolved_voice_model}
+        files = {"file": ("voice.ogg", voice_bytes, "audio/ogg")}
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    self.config.custom_voice_url,
+                    headers=headers,
+                    data=data,
+                    files=files,
+                )
+                response.raise_for_status()
+                result = response.json()
+        except Exception as exc:
+            logger.warning(
+                "Custom voice transcription request failed",
+                error_type=type(exc).__name__,
+                details=str(exc)
+            )
+            raise RuntimeError(f"Custom transcription request failed: {exc}") from exc
+
+        text = result.get("text", "").strip()
+        if not text:
+            raise ValueError("Custom transcription returned an empty response.")
+        return text
 
     async def _transcribe_openai(self, voice_bytes: bytes) -> str:
         """Transcribe audio using the OpenAI Whisper API."""

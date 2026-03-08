@@ -81,7 +81,11 @@ class FeatureRegistry:
         # Voice transcription - requires provider-specific API key
         voice_key_available = (
             self.config.voice_provider == "openai" and self.config.openai_api_key
-        ) or (self.config.voice_provider == "mistral" and self.config.mistral_api_key)
+        ) or (
+            self.config.voice_provider == "mistral" and self.config.mistral_api_key
+        ) or (
+            self.config.voice_provider == "custom" and self.config.custom_voice_url
+        )
         if self.config.enable_voice_messages and voice_key_available:
             try:
                 self.features["voice_handler"] = VoiceHandler(config=self.config)
