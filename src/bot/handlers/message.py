@@ -1103,10 +1103,27 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
 
             from ..utils.formatting import ResponseFormatter
+            from ..utils.html_format import escape_html
 
             formatter = ResponseFormatter(settings)
+            response_text = claude_response.content
+            
+            if not response_text or not str(response_text).strip():
+                if claude_response.tools_used:
+                    lines = ["<b>✅ 已执行以下操作：</b>"]
+                    for tool in claude_response.tools_used:
+                        name = tool.get("name", "unknown")
+                        if name == "Bash":
+                            cmd = escape_html(tool.get("input", {}).get("command", ""))
+                            lines.append(f"🐚 <code>Bash({cmd})</code>")
+                        else:
+                            lines.append(f"🔧 <code>{escape_html(name)}</code>")
+                    response_text = "\n".join(lines)
+                else:
+                    response_text = f"🎙️ <b>语音转录结果：</b>\n\n{escape_html(processed_voice.transcription)}"
+
             formatted_messages = formatter.format_claude_response(
-                claude_response.content
+                response_text
             )
 
             await progress_msg.delete()
