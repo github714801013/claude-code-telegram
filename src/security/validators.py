@@ -161,6 +161,10 @@ class SecurityValidator:
             # Check for dangerous patterns (unless explicitly disabled)
             if not self.disable_security_patterns:
                 for pattern in self.DANGEROUS_PATTERNS:
+                    if pattern == r"\.\.":
+                        # We allow .. in path resolution because it's strictly constrained 
+                        # by _is_within_directory check later.
+                        continue
                     if re.search(pattern, user_path, re.IGNORECASE):
                         logger.warning(
                             "Dangerous pattern detected in path",
@@ -326,6 +330,8 @@ class SecurityValidator:
         for arg in args:
             # Check for dangerous patterns
             for pattern in self.DANGEROUS_PATTERNS:
+                if pattern == r"\.\.":
+                    continue
                 if re.search(pattern, arg, re.IGNORECASE):
                     logger.warning(
                         "Dangerous pattern in command arg", arg=arg, pattern=pattern

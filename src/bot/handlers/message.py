@@ -1,7 +1,7 @@
 """Message handlers for non-command inputs."""
 
 import asyncio
-from typing import Optional
+from typing import Optional, Any
 
 import structlog
 from telegram import InputMediaPhoto, Update
@@ -451,7 +451,7 @@ async def handle_text_message(
 
             formatter = ResponseFormatter(settings)
             formatted_messages = formatter.format_claude_response(
-                claude_response.content
+                _get_response_text_with_fallback(claude_response)
             )
 
         except Exception as e:
@@ -865,7 +865,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             formatter = ResponseFormatter(settings)
             formatted_messages = formatter.format_claude_response(
-                claude_response.content
+                _get_response_text_with_fallback(claude_response)
             )
 
             # Delete progress message
@@ -987,7 +987,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
                 formatter = ResponseFormatter(settings)
                 formatted_messages = formatter.format_claude_response(
-                    claude_response.content
+                    _get_response_text_with_fallback(claude_response)
                 )
 
                 # Delete progress message
@@ -1068,75 +1068,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             voice, update.message.caption
         )
 
-        await progress_msg.edit_text(
-            "🤖 Processing transcription with Claude...", parse_mode="HTML"
-        )
-
-        claude_integration = context.bot_data.get("claude_integration")
-        if not claude_integration:
-            await progress_msg.edit_text(
-                "❌ <b>Claude integration not available</b>\n\n"
-                "The Claude Code integration is not properly configured.",
-                parse_mode="HTML",
-            )
-            return
-
-        current_dir = context.user_data.get(
-            "current_directory", settings.approved_directory
-        )
-        session_id = context.user_data.get("claude_session_id")
-
         try:
-            # Keep classic mode aligned with handle_photo: single progress message,
-            # no streaming callback or typing heartbeat.
-            claude_response = await claude_integration.run_command(
-                prompt=processed_voice.prompt,
-                working_directory=current_dir,
-                user_id=user_id,
-                session_id=session_id,
-            )
-
-            context.user_data["claude_session_id"] = claude_response.session_id
-
-            _update_working_directory_from_claude_response(
-                claude_response, context, settings, user_id
-            )
-
-            from ..utils.formatting import ResponseFormatter
             from ..utils.html_format import escape_html
-
-            formatter = ResponseFormatter(settings)
-            response_text = claude_response.content
-            
-            if not response_text or not str(response_text).strip():
-                if claude_response.tools_used:
-                    lines = ["<b>✅ 已执行以下操作：</b>"]
-                    for tool in claude_response.tools_used:
-                        name = tool.get("name", "unknown")
-                        if name == "Bash":
-                            cmd = escape_html(tool.get("input", {}).get("command", ""))
-                            lines.append(f"🐚 <code>Bash({cmd})</code>")
-                        else:
-                            lines.append(f"🔧 <code>{escape_html(name)}</code>")
-                    response_text = "\n".join(lines)
-                else:
-                    response_text = f"🎙️ <b>语音转录结果：</b>\n\n{escape_html(processed_voice.transcription)}"
-
-            formatted_messages = formatter.format_claude_response(
-                response_text
+            text = (
+                f"🎙️ <b>语音识别结果</b> (点击文本可快捷复制)：\n\n"
+                f"<code>{escape_html(processed_voice.prompt)}</code>\n\n"
+                f"<i>确认无误后，请直接粘贴并发送给我。</i>"
             )
-
-            await progress_msg.delete()
-
-            for i, message in enumerate(formatted_messages):
-                await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
-                    reply_markup=message.reply_markup,
-                    reply_to_message_id=(update.message.message_id if i == 0 else None),
-                )
-                if i < len(formatted_messages) - 1:
-                    await asyncio.sleep(0.5)
+            await progress_msg.edit_text(text, parse_mode="HTML")
 
         except Exception as e:
             await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
@@ -1266,9 +1205,29 @@ async def _generate_placeholder_response(
     return {"text": response_text, "parse_mode": "HTML"}
 
 
+
+def _get_response_text_with_fallback(claude_response: Any, fallback_text: Optional[str] = None) -> str:
+    from ..utils.html_format import escape_html
+    response_text = claude_response.content
+    
+    if not response_text or not str(response_text).strip():
+        if claude_response.tools_used:
+            lines = ["<b>✅ 已执行以下操作：</b>"]
+            for tool in claude_response.tools_used:
+                name = tool.get("name", "unknown")
+                if name == "Bash":
+                    cmd = escape_html(tool.get("input", {}).get("command", ""))
+                    lines.append(f"🐚 <code>Bash({cmd})</code>")
+                else:
+                    lines.append(f"🔧 <code>{escape_html(name)}</code>")
+            return "\n".join(lines)
+        elif fallback_text:
+            return escape_html(fallback_text) if "<b>" not in fallback_text else fallback_text # Simple HTML check
+    return response_text or ""
+
 def _update_working_directory_from_claude_response(
-    claude_response, context, settings, user_id
-):
+    claude_response: Any, context: ContextTypes.DEFAULT_TYPE, settings: Settings, user_id: int
+) -> None:
     """Update the working directory based on Claude's response content."""
     import re
     from pathlib import Path

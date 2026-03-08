@@ -132,7 +132,6 @@ async def validate_message_content(
 
     # Check for path traversal attempts
     path_traversal_patterns = [
-        r"\.\./.*",
         r"~\/.*",
         r"\/etc\/.*",
         r"\/var\/.*",

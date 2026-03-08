@@ -1521,16 +1521,12 @@ class MessageOrchestrator:
                 voice, caption
             )
 
-            await progress_msg.edit_text("Working...")
-            await self._handle_agentic_media_message(
-                update=update,
-                context=context,
-                prompt=processed_voice.prompt,
-                progress_msg=progress_msg,
-                user_id=user_id,
-                chat=chat,
-                fallback_text=f"🎙️ <b>语音转录结果：</b>\n\n{escape_html(processed_voice.transcription)}",
+            text = (
+                f"🎙️ <b>语音识别结果</b> (点击文本可快捷复制)：\n\n"
+                f"<code>{escape_html(processed_voice.prompt)}</code>\n\n"
+                f"<i>确认无误后，请直接粘贴并发送给我。</i>"
             )
+            await progress_msg.edit_text(text, parse_mode="HTML")
 
         except Exception as e:
             from .handlers.message import _format_error_message
