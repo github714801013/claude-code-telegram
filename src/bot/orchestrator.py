@@ -810,10 +810,10 @@ class MessageOrchestrator:
                 for tc in update_obj.tool_calls:
                     name = tc.get("name", "unknown")
                     detail = self._summarize_tool_input(name, tc.get("input", {}))
-                    if verbose_level >= 1:
-                        tool_log.append(
-                            {"kind": "tool", "name": name, "detail": detail}
-                        )
+                    # 始终记录 tool_log（用于 content 为空时的兜底摘要展示）
+                    tool_log.append(
+                        {"kind": "tool", "name": name, "detail": detail}
+                    )
                     if draft_streamer:
                         icon = _tool_icon(name)
                         line = (
@@ -1124,6 +1124,20 @@ class MessageOrchestrator:
                 if getattr(claude_response, "history_context", None):
                     recent_msgs = claude_response.history_context
                     response_text = "<i>(由于内容为空，显示最近的会话记录)</i>\n\n" + "\n\n".join(recent_msgs)
+                elif tool_log:
+                    # Claude 只执行了工具但未返回文字，生成工具摘要
+                    lines = ["<b>✅ 已执行以下操作：</b>"]
+                    for entry in tool_log:
+                        if entry.get("kind") == "tool":
+                            icon = _tool_icon(entry["name"])
+                            detail = entry.get("detail", "")
+                            if detail:
+                                lines.append(f"{icon} <code>{escape_html(entry['name'])}({escape_html(detail)})</code>")
+                            else:
+                                lines.append(f"{icon} <code>{escape_html(entry['name'])}</code>")
+                        elif entry.get("kind") == "text":
+                            lines.append(f"💬 {escape_html(entry.get('detail', ''))}")
+                    response_text = "\n".join(lines)
 
             formatted_messages = formatter.format_claude_response(
                 response_text
