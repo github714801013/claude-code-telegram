@@ -158,6 +158,26 @@ class SessionManager:
                 self.active_sessions[session_id] = session
                 logger.info("Loaded session from storage", session_id=session_id)
                 return session
+            
+            # Session not found in DB (e.g. a CLI session resumed via /cc -r).
+            # Create a lightweight placeholder that marks is_new_session=False so
+            # the SDK knows to pass --resume SESSION_ID instead of starting fresh.
+            if session_id:
+                cli_session = ClaudeSession(
+                    session_id=session_id,
+                    user_id=user_id,
+                    project_path=project_path,
+                    created_at=datetime.now(UTC),
+                    last_used=datetime.now(UTC),
+                    is_new_session=False,  # Tell SDK to resume, not start fresh
+                )
+                self.active_sessions[session_id] = cli_session
+                logger.info(
+                    "Created placeholder for CLI session to enable resume",
+                    session_id=session_id,
+                    user_id=user_id,
+                )
+                return cli_session
 
         # Check user session limit
         user_sessions = await self._get_user_sessions(user_id)

@@ -181,15 +181,22 @@ class SessionRepository:
     async def get_user_sessions(
         self, user_id: int, active_only: bool = True
     ) -> List[SessionModel]:
-        """Get sessions for user."""
+        """Get sessions for user, including the first prompt as session name."""
         async with self.db.get_connection() as conn:
-            query = "SELECT * FROM sessions WHERE user_id = ?"
+            query = """
+                SELECT s.*, 
+                       (SELECT prompt FROM messages m 
+                        WHERE m.session_id = s.session_id 
+                        ORDER BY timestamp ASC LIMIT 1) as session_name
+                FROM sessions s
+                WHERE s.user_id = ?
+            """
             params = [user_id]
 
             if active_only:
-                query += " AND is_active = TRUE"
+                query += " AND s.is_active = TRUE"
 
-            query += " ORDER BY last_used DESC"
+            query += " ORDER BY s.last_used DESC"
 
             cursor = await conn.execute(query, params)
             rows = await cursor.fetchall()
@@ -214,13 +221,17 @@ class SessionRepository:
             return affected
 
     async def get_sessions_by_project(self, project_path: str) -> List[SessionModel]:
-        """Get sessions for a specific project."""
+        """Get sessions for a specific project, including session_name."""
         async with self.db.get_connection() as conn:
             cursor = await conn.execute(
                 """
-                SELECT * FROM sessions
-                WHERE project_path = ? AND is_active = TRUE
-                ORDER BY last_used DESC
+                SELECT s.*,
+                       (SELECT prompt FROM messages m 
+                        WHERE m.session_id = s.session_id 
+                        ORDER BY timestamp ASC LIMIT 1) as session_name
+                FROM sessions s
+                WHERE s.project_path = ? AND s.is_active = TRUE
+                ORDER BY s.last_used DESC
             """,
                 (project_path,),
             )

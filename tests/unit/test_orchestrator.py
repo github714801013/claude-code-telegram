@@ -74,11 +74,11 @@ def private_thread_settings(tmp_dir):
 @pytest.fixture
 def deps():
     return {
-        "claude_integration": MagicMock(),
-        "storage": MagicMock(),
+        "claude_integration": AsyncMock(),
+        "storage": AsyncMock(),
         "security_validator": MagicMock(),
         "rate_limiter": MagicMock(),
-        "audit_logger": MagicMock(),
+        "audit_logger": AsyncMock(),
     }
 
 
@@ -926,3 +926,202 @@ async def test_private_mode_rejects_help_outside_topics(private_thread_settings,
 
     assert called["value"] is False
     update.effective_message.reply_text.assert_called_once()
+
+
+async def test_agentic_cc_empty_args_shows_usage_and_logs_security_event(agentic_settings, deps):
+    """/cc with no arguments shows usage and logs security event."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "/cc"
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.bot_data = {
+        "settings": agentic_settings,
+        "storage": deps["storage"],
+    }
+    context.user_data = {}
+
+    await orchestrator.agentic_cc(update, context)
+
+    # Should show usage message
+    update.message.reply_text.assert_called_once_with("用法：/cc <claude 参数>")
+
+    # Should log security event
+    deps["storage"].log_security_event.assert_awaited_once()
+    call_kwargs = deps["storage"].log_security_event.call_args.kwargs
+    assert call_kwargs["user_id"] == 123
+    assert call_kwargs["event_type"] == "cc_rejected"
+    assert call_kwargs["event_data"]["reason"] == "empty_args"
+    assert call_kwargs["success"] is False
+
+
+async def test_agentic_cc_too_long_rejected_and_logs_security_event(agentic_settings, deps):
+    """/cc with args >2000 chars is rejected."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "/cc " + "x" * 2001  # 2001 chars total, >2000 limit
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.bot_data = {
+        "settings": agentic_settings,
+        "storage": deps["storage"],
+    }
+    context.user_data = {}
+
+    await orchestrator.agentic_cc(update, context)
+
+    # Should show length error
+    update.message.reply_text.assert_called_once_with("参数过长（最大 2000 字符）")
+
+    # Should log security event
+    deps["storage"].log_security_event.assert_awaited_once()
+    call_kwargs = deps["storage"].log_security_event.call_args.kwargs
+    assert call_kwargs["event_data"]["reason"] == "too_long"
+    assert call_kwargs["event_data"]["args_len"] == 2001  # 2001 chars after extraction
+
+
+async def test_agentic_cc_dangerously_flag_rejected_and_logs_security_event(agentic_settings, deps):
+    """/cc with --dangerously flag is rejected, including shell-quoted variants."""
+    test_cases = [
+        # (input_text, description)
+        ("/cc --dangerouslyDisableSandbox true", "plain dangerous flag"),
+        ('/cc "--dangerouslyDisableSandbox"', "double-quoted dangerous flag"),
+        ("/cc '--dangerouslyDisableSandbox'", "single-quoted dangerous flag"),
+        ('/cc "--dangerouslyDisableSandbox true"', "double-quoted flag with value"),
+        ("/cc '--dangerouslyDisableSandbox true'", "single-quoted flag with value"),
+        ("/cc --dangerously", "bare dangerous prefix"),
+        ('/cc "--dangerously"', "double-quoted bare prefix"),
+        ("/cc '--dangerously'", "single-quoted bare prefix"),
+        ("/cc -r 1234 --dangerouslyDisableSandbox", "mixed with safe args"),
+        ("/cc -r 1234 '--dangerouslyDisableSandbox'", "mixed with quoted dangerous flag"),
+    ]
+
+    for input_text, description in test_cases:
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+        update = MagicMock()
+        update.effective_user.id = 123
+        update.message.text = input_text
+        update.message.reply_text = AsyncMock()
+
+        context = MagicMock()
+        context.bot_data = {
+            "settings": agentic_settings,
+            "storage": deps["storage"],
+        }
+        context.user_data = {}
+
+        # Reset mocks for each iteration
+        update.message.reply_text.reset_mock()
+        deps["storage"].log_security_event.reset_mock()
+
+        await orchestrator.agentic_cc(update, context)
+
+        # Should show dangerous flag error
+        update.message.reply_text.assert_called_once_with("参数包含危险标记（--dangerously*）")
+
+        # Should log security event
+        deps["storage"].log_security_event.assert_awaited_once()
+        call_kwargs = deps["storage"].log_security_event.call_args.kwargs
+        assert call_kwargs["event_data"]["reason"] == "dangerous_flag"
+        assert call_kwargs["user_id"] == 123
+
+
+async def test_agentic_cc_calls_claude_with_prefixed_prompt(agentic_settings, deps):
+    """Valid /cc arguments are prefixed and passed to Claude."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    # Mock Claude response
+    mock_response = MagicMock()
+    mock_response.session_id = "session-cc-123"
+    mock_response.content = "Claude response"
+    mock_response.tools_used = []
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(return_value=mock_response)
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "/cc -r 1234 --print '重构代码'"
+    update.message.message_id = 1
+    update.message.chat.send_action = AsyncMock()
+    update.message.reply_text = AsyncMock()
+
+    # Progress message mock
+    progress_msg = AsyncMock()
+    progress_msg.delete = AsyncMock()
+    update.message.reply_text.return_value = progress_msg
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {
+        "settings": agentic_settings,
+        "claude_integration": claude_integration,
+        "storage": None,
+        "rate_limiter": None,
+        "audit_logger": None,
+    }
+
+    await orchestrator.agentic_cc(update, context)
+
+    # Claude should be called with prefixed prompt
+    claude_integration.run_command.assert_called_once()
+    call_kwargs = claude_integration.run_command.call_args.kwargs
+    assert call_kwargs["prompt"] == "执行 claude 参数：\n-r 1234 --print '重构代码'"
+    assert call_kwargs["user_id"] == 123
+
+    # Session ID updated
+    assert context.user_data["claude_session_id"] == "session-cc-123"
+
+
+async def test_agentic_text_still_calls_claude_after_refactor(agentic_settings, deps):
+    """Regression: agentic_text still works after extracting _run_agentic_prompt."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    # Mock Claude response
+    mock_response = MagicMock()
+    mock_response.session_id = "session-text-123"
+    mock_response.content = "Claude response"
+    mock_response.tools_used = []
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(return_value=mock_response)
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "Help me with this code"
+    update.message.message_id = 1
+    update.message.chat.send_action = AsyncMock()
+    update.message.reply_text = AsyncMock()
+
+    # Progress message mock
+    progress_msg = AsyncMock()
+    progress_msg.delete = AsyncMock()
+    update.message.reply_text.return_value = progress_msg
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {
+        "settings": agentic_settings,
+        "claude_integration": claude_integration,
+        "storage": None,
+        "rate_limiter": None,
+        "audit_logger": None,
+    }
+
+    await orchestrator.agentic_text(update, context)
+
+    # Claude should be called with original prompt (no prefix)
+    claude_integration.run_command.assert_called_once()
+    call_kwargs = claude_integration.run_command.call_args.kwargs
+    assert call_kwargs["prompt"] == "Help me with this code"
+    assert call_kwargs["user_id"] == 123
+
+    # Session ID updated
+    assert context.user_data["claude_session_id"] == "session-text-123"

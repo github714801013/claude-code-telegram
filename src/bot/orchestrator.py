@@ -7,6 +7,7 @@ classic mode, delegates to existing full-featured handlers.
 
 import asyncio
 import re
+import shlex
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -81,6 +82,34 @@ def _redact_secrets(text: str) -> str:
             result,
         )
     return result
+
+
+def _extract_command_args(text: str, command: str) -> str:
+    """Extract arguments from a command like '/cc args' or '/cc@botname args'.
+
+    Returns the argument string (trimmed), or empty string if no arguments.
+    """
+    # Handle /command@botname format
+    pattern = rf"^/{re.escape(command)}(?:@\w+)?\s+"
+    match = re.match(pattern, text)
+    if not match:
+        return ""
+
+    # Return everything after the matched prefix, stripped
+    return text[match.end():].strip()
+
+
+def _split_shell_args(text: str) -> List[str]:
+    """Split shell arguments, respecting quotes.
+
+    Uses shlex.split() but falls back to simple whitespace split if parsing fails.
+    """
+    try:
+        return shlex.split(text)
+    except ValueError:
+        # If quotes are mismatched, fall back to simple whitespace split
+        # This is less accurate but still safe for detecting dangerous flags
+        return text.split()
 
 
 # Tool name -> friendly emoji mapping for verbose output
@@ -308,12 +337,17 @@ class MessageOrchestrator:
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
+            ("cc", command.cc_command),
+            ("skills", command.skills_command),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
 
         for cmd, handler in handlers:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
+
+        # Unknown ! commands -> Claude (! prefix avoids conflicts with Telegram commands)
+        # e.g. !clear -> /clear  sent to Claude
 
         # Text messages -> Claude
         app.add_handler(
@@ -373,12 +407,17 @@ class MessageOrchestrator:
             ("actions", command.quick_actions),
             ("git", command.git_command),
             ("restart", command.restart_command),
+            ("cc", command.cc_command),
+            ("skills", command.skills_command),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
 
         for cmd, handler in handlers:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
+
+        # Unknown ! commands -> Claude (! prefix avoids conflicts with Telegram commands)
+        # e.g. !clear -> /clear  sent to Claude
 
         app.add_handler(
             MessageHandler(
@@ -417,6 +456,7 @@ class MessageOrchestrator:
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("restart", "Restart the bot"),
+                BotCommand("cc", "执行 claude 参数"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -437,6 +477,7 @@ class MessageOrchestrator:
                 BotCommand("actions", "Show quick actions"),
                 BotCommand("git", "Git repository commands"),
                 BotCommand("restart", "Restart the bot"),
+                BotCommand("cc", "执行 claude 参数"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -532,9 +573,19 @@ class MessageOrchestrator:
             except Exception:
                 pass
 
-        await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
-        )
+        msg = f"📂 {dir_display} · Session: {session_status}{cost_str}"
+
+        if session_id:
+            from .handlers.command import _get_session_recent_messages, escape_html
+            recent_msgs = _get_session_recent_messages(session_id, n=2)
+            if recent_msgs:
+                msg += "\n\n💬 <b>最近进度:</b>\n"
+                for role, text in recent_msgs:
+                    icon = "👤" if role == "user" else "🤖"
+                    preview = text[:150] + "..." if len(text) > 150 else text
+                    msg += f"{icon} <i>{escape_html(preview)}</i>\n"
+
+        await update.message.reply_text(msg, parse_mode="HTML")
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
@@ -583,9 +634,10 @@ class MessageOrchestrator:
         activity_log: List[Dict[str, Any]],
         verbose_level: int,
         start_time: float,
+        live_text: str = "",
     ) -> str:
         """Build the progress message text based on activity so far."""
-        if not activity_log:
+        if not activity_log and not live_text:
             return "Working..."
 
         elapsed = time.time() - start_time
@@ -612,6 +664,13 @@ class MessageOrchestrator:
         if len(activity_log) > 15:
             lines.insert(1, f"... ({len(activity_log) - 15} earlier entries)\n")
 
+        if live_text:
+            # show a snippet of the live text being generated, truncated if too long
+            display_text = live_text[-200:] if len(live_text) > 200 else live_text
+            if len(live_text) > 200:
+                display_text = "..." + display_text
+            lines.append(f"\n\U0000270d\U0000fe0f <i>{escape_html(display_text)}</i>")
+
         return "\n".join(lines)
 
     @staticmethod
@@ -619,21 +678,47 @@ class MessageOrchestrator:
         """Return a short summary of tool input for verbose level 2."""
         if not tool_input:
             return ""
-        if tool_name in ("Read", "Write", "Edit", "MultiEdit"):
-            path = tool_input.get("file_path") or tool_input.get("path", "")
-            if path:
-                # Show just the filename, not the full path
-                return path.rsplit("/", 1)[-1]
+
+        if tool_name in ("Read", "Write", "Edit", "MultiEdit", "View"):
+            # Try to handle multiple files or single file
+            paths = []
+            if "file_paths" in tool_input and isinstance(tool_input["file_paths"], list):
+                paths = tool_input["file_paths"]
+            elif "file_path" in tool_input:
+                paths = [tool_input["file_path"]]
+            elif "path" in tool_input:
+                paths = [tool_input["path"]]
+            elif "target_file" in tool_input:
+                paths = [tool_input["target_file"]]
+            
+            if paths:
+                # Get basenames
+                basenames = [str(p).rsplit("/", 1)[-1].rsplit("\\", 1)[-1] for p in paths]
+                names_str = ", ".join(basenames)
+                
+                if tool_name in ("Edit", "MultiEdit"):
+                    # e.g., Update(src/bot/orchestrator.py)
+                    return f"({names_str})"
+                else:
+                    count = len(paths)
+                    plural = "s" if count > 1 else ""
+                    # e.g., 2 files (a.py, b.py)
+                    display = f"{count} file{plural} ({names_str})"
+                    return display[:80] + ("..." if len(display) > 80 else "")
+
         if tool_name in ("Glob", "Grep"):
             pattern = tool_input.get("pattern", "")
             if pattern:
-                return pattern[:60]
-        if tool_name == "Bash":
-            cmd = tool_input.get("command", "")
+                return f"'{pattern}'"[:60]
+                
+        if tool_name == "Bash" or tool_name == "RunCommand":
+            cmd = tool_input.get("command", "") or tool_input.get("command_line", "")
             if cmd:
                 return _redact_secrets(cmd[:100])[:80]
+                
         if tool_name in ("WebFetch", "WebSearch"):
             return (tool_input.get("url", "") or tool_input.get("query", ""))[:60]
+            
         if tool_name == "Task":
             desc = tool_input.get("description", "")
             if desc:
@@ -699,6 +784,7 @@ class MessageOrchestrator:
             return None
 
         last_edit_time = [0.0]  # mutable container for closure
+        live_text_acc = [""]    # mutable container for in-progress text stream
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
             # Intercept send_image_to_user MCP tool calls.
@@ -738,6 +824,7 @@ class MessageOrchestrator:
             # Capture assistant text (reasoning / commentary)
             if update_obj.type == "assistant" and update_obj.content:
                 text = update_obj.content.strip()
+                live_text_acc[0] = ""  # clear live text since it's now finalized
                 if text:
                     first_line = text.split("\n", 1)[0].strip()
                     if first_line:
@@ -752,17 +839,20 @@ class MessageOrchestrator:
 
             # Stream text to user via draft (prefer token deltas;
             # skip full assistant messages to avoid double-appending)
-            if draft_streamer and update_obj.content:
-                if update_obj.type == "stream_delta":
+            if update_obj.content and update_obj.type == "stream_delta":
+                if draft_streamer:
                     await draft_streamer.append_text(update_obj.content)
+                else:
+                    live_text_acc[0] += update_obj.content
 
             # Throttle progress message edits to avoid Telegram rate limits
             if not draft_streamer and verbose_level >= 1:
                 now = time.time()
-                if (now - last_edit_time[0]) >= 2.0 and tool_log:
+                # Update if interval elapsed and we have either tools or live text
+                if (now - last_edit_time[0]) >= 2.0 and (tool_log or live_text_acc[0]):
                     last_edit_time[0] = now
                     new_text = self._format_verbose_progress(
-                        tool_log, verbose_level, start_time
+                        tool_log, verbose_level, start_time, live_text=live_text_acc[0]
                     )
                     try:
                         await progress_msg.edit_text(new_text)
@@ -860,17 +950,26 @@ class MessageOrchestrator:
 
         return caption_sent
 
-    async def agentic_text(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    async def _run_agentic_prompt(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        prompt: str,
+        command_name: str = "text_message",
+        session_id_override: Optional[str] = None,
     ) -> None:
-        """Direct Claude passthrough. Simple progress. No suggestions."""
+        """Core execution logic for agentic text prompts.
+
+        Shared by agentic_text and agentic_cc.
+        """
         user_id = update.effective_user.id
-        message_text = update.message.text
+        message_text = prompt  # The prompt to send to Claude
 
         logger.info(
-            "Agentic text message",
+            "Agentic prompt execution",
             user_id=user_id,
-            message_length=len(message_text),
+            command=command_name,
+            prompt_length=len(prompt),
         )
 
         # Rate limit check
@@ -894,10 +993,24 @@ class MessageOrchestrator:
             )
             return
 
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory
-        )
-        session_id = context.user_data.get("claude_session_id")
+        from pathlib import Path
+        project_root = None
+        if self.settings.enable_project_threads:
+            thread_context = context.user_data.get("_thread_context")
+            if thread_context and "project_root" in thread_context:
+                project_root = Path(thread_context["project_root"]).resolve()
+
+        current_dir = context.user_data.get("current_directory")
+        if current_dir:
+            # Check if it's valid within the project root
+            if project_root:
+                try:
+                    current_dir.resolve().relative_to(project_root)
+                except ValueError:
+                    current_dir = project_root
+        else:
+            current_dir = project_root if project_root else self.settings.approved_directory
+        session_id = session_id_override or context.user_data.get("claude_session_id")
 
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
@@ -949,6 +1062,37 @@ class MessageOrchestrator:
 
             context.user_data["claude_session_id"] = claude_response.session_id
 
+            # Detect "Unknown skill: xxx" — the skill exists locally but isn't activated
+            import re as _re
+            _skill_err = _re.fullmatch(r"Unknown skill:\s*(\S+)", (claude_response.content or "").strip())
+            if _skill_err:
+                _skill_name = _skill_err.group(1)
+                from .handlers.command import _read_skills_from_dir
+                import os as _os
+                _claude_home = Path.home() / ".claude"
+                _seen2: set = set(); _all2: list = []
+                def _collect2(d):
+                    if not d.exists(): return
+                    for _r2, _dn2, _ in _os.walk(d):
+                        _dn2[:] = [x for x in _dn2 if not x.startswith(".") and x not in ("__pycache__", ".venv")]
+                        if Path(_r2).name == "commands":
+                            for n2, _ in _read_skills_from_dir(Path(_r2)):
+                                if n2 not in _seen2:
+                                    _seen2.add(n2); _all2.append(n2)
+                _collect2(_claude_home / "commands"); _collect2(_claude_home / "plugins"); _collect2(_claude_home / "skills")
+                _fuzzy = [n for n in _all2 if _skill_name in n or n in _skill_name][:6]
+                from telegram import InlineKeyboardButton as _IKB, InlineKeyboardMarkup as _IKM
+                _rows = [[_IKB(f"/{m}", switch_inline_query_current_chat=f"!{m} ")] for m in _fuzzy]
+                await update.message.reply_text(
+                    f"⚠️ <b>Skill <code>!{_skill_name}</code> 未激活</b>\n\n"
+                    f"该 skill 存在于文件中但未在 Claude CLI 中安装启用。\n"
+                    f"请在 Claude CLI 中运行 <code>/install</code> 安装对应插件，或使用 <code>/skills</code> 查看已激活的 skill。"
+                    + ("\n\n相似可用项：" if _rows else ""),
+                    parse_mode="HTML",
+                    reply_markup=_IKM(_rows) if _rows else None,
+                )
+                return
+
             # Track directory changes
             from .handlers.message import _update_working_directory_from_claude_response
 
@@ -974,8 +1118,19 @@ class MessageOrchestrator:
             from .utils.formatting import ResponseFormatter
 
             formatter = ResponseFormatter(self.settings)
+
+            response_text = claude_response.content
+            if not response_text or not str(response_text).strip():
+                try:
+                    from .handlers.command import _get_session_recent_messages
+                    recent_msgs = _get_session_recent_messages(claude_response.session_id, n=5)
+                    if recent_msgs:
+                        response_text = "<i>(由于内容为空，显示最近 5 条会话记录)</i>\n\n" + "\n\n".join(recent_msgs)
+                except Exception:
+                    pass
+
             formatted_messages = formatter.format_claude_response(
-                claude_response.content
+                response_text
             )
 
         except Exception as e:
@@ -1075,10 +1230,43 @@ class MessageOrchestrator:
         if audit_logger:
             await audit_logger.log_command(
                 user_id=user_id,
-                command="text_message",
-                args=[message_text[:100]],
+                command=command_name,
+                args=[prompt[:100]],
                 success=success,
             )
+
+    async def agentic_text(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Direct Claude passthrough. Simple progress. No suggestions."""
+        message_text = update.message.text or ""
+        
+        # Handle ! prefix commands (Claude TUI commands mapped to bot actions)
+        if message_text.startswith("!"):
+            cmd = message_text[1:].split()[0].lower().strip()
+            
+            # !clear / !new  → start a new session (equivalent to Claude's /clear)
+            if cmd in ("clear", "new", "reset"):
+                context.user_data["claude_session_id"] = None
+                context.user_data["force_new_session"] = True
+                await update.message.reply_text(
+                    "🆕 <b>上下文已清除</b>\n\n会话已重置，发送消息开始新对话。",
+                    parse_mode="HTML",
+                )
+                return
+            
+            # !compact → not supported via SDK, guide user  
+            if cmd == "compact":
+                await update.message.reply_text(
+                    "ℹ️ <b>不支持 /compact</b>\n\n"
+                    "SDK 模式不支持压缩对话，请使用 <code>!clear</code> 清除上下文后继续。",
+                    parse_mode="HTML",
+                )
+                return
+            # Other !xxx → forward as /xxx  to Claude (may be a registered skill)
+            message_text = "/" + message_text[1:] + " "
+
+        await self._run_agentic_prompt(update, context, message_text, "text_message")
 
     async def agentic_document(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

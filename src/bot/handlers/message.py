@@ -72,7 +72,11 @@ async def _format_progress_update(update_obj) -> Optional[str]:
 
     elif update_obj.type == "assistant" and update_obj.tool_calls:
         # Show when tools are being called
-        tool_names = update_obj.get_tool_names()
+        import logging
+        try:
+            tool_names = [tc.get("name", "unknown") for tc in update_obj.tool_calls if isinstance(tc, dict)]
+        except Exception:
+            tool_names = []
         if tool_names:
             tools_text = ", ".join(tool_names)
             return f"🔧 <b>Using tools:</b> {tools_text}"
@@ -298,7 +302,29 @@ async def handle_text_message(
 ) -> None:
     """Handle regular text messages as Claude prompts."""
     user_id = update.effective_user.id
-    message_text = update.message.text
+    message_text = update.message.text or ""
+    
+    # Handle ! prefix commands (Claude TUI commands mapped to bot actions)
+    if message_text.startswith("!"):
+        cmd = message_text[1:].split()[0].lower().strip()
+        if cmd in ("clear", "new", "reset"):
+            context.user_data["claude_session_id"] = None
+            context.user_data["force_new_session"] = True
+            await update.message.reply_text(
+                "🆕 <b>上下文已清除</b>\n\n会话已重置，发送消息开始新对话。",
+                parse_mode="HTML",
+            )
+            return
+        if cmd == "compact":
+            await update.message.reply_text(
+                "ℹ️ <b>不支持 /compact</b>\n\n"
+                "SDK 模式不支持压缩对话，请使用 <code>!clear</code> 清除上下文后继续。",
+                parse_mode="HTML",
+            )
+            return
+        # Other !xxx → forward as /xxx  to Claude (may be a registered skill)
+        message_text = "/" + message_text[1:] + " "
+    
     settings: Settings = context.bot_data["settings"]
 
     # Get services

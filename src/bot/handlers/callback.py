@@ -16,27 +16,6 @@ from ..utils.html_format import escape_html
 logger = structlog.get_logger()
 
 
-def _is_within_root(path: Path, root: Path) -> bool:
-    """Check whether path is within root directory."""
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
-
-
-def _get_thread_project_root(
-    settings: Settings, context: ContextTypes.DEFAULT_TYPE
-) -> Optional[Path]:
-    """Get thread project root when strict thread mode is active."""
-    if not settings.enable_project_threads:
-        return None
-    thread_context = context.user_data.get("_thread_context")
-    if not thread_context:
-        return None
-    return Path(thread_context["project_root"]).resolve()
-
-
 async def handle_callback_query(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -66,6 +45,7 @@ async def handle_callback_query(
             "conversation": handle_conversation_callback,
             "git": handle_git_callback,
             "export": handle_export_callback,
+            "resume": handle_resume_callback,
         }
 
         handler = handlers.get(action)
@@ -285,6 +265,47 @@ async def handle_confirm_callback(
             "❓ <b>Unknown confirmation response</b>",
             parse_mode="HTML",
         )
+
+
+async def handle_resume_callback(
+    query, session_id: str, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle session resumption from inline keyboard."""
+    user_id = query.from_user.id
+    settings: Settings = context.bot_data["settings"]
+    claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
+
+    if not claude_integration:
+        await query.edit_message_text("❌ <b>Claude Integration Not Available</b>", parse_mode="HTML")
+        return
+
+    context.user_data["claude_session_id"] = session_id
+    context.user_data["force_new_session"] = False
+    
+    session_name = context.user_data.get("session_names", {}).get(session_id)
+    name_display = f"\n名称: <b>{escape_html(session_name)}</b>" if session_name else ""
+    
+    # Load recent messages for context preview
+    from .command import _get_session_recent_messages
+    recent = _get_session_recent_messages(session_id, n=4)
+    
+    history_lines = []
+    for role, text in recent:
+        icon = "👤" if role == "user" else "🤖"
+        # Truncate long messages
+        preview = text.replace("\n", " ").strip()
+        if len(preview) > 80:
+            preview = preview[:79] + "…"
+        history_lines.append(f"{icon} <i>{escape_html(preview)}</i>")
+    
+    history_str = "\n".join(history_lines)
+    history_block = f"\n\n<b>最近对话：</b>\n{history_str}" if history_lines else ""
+    
+    await query.edit_message_text(
+        f"✅ <b>会话已恢复</b>{name_display}{history_block}\n\n"
+        f"Session ID: <code>{escape_html(session_id[:8])}...</code>\n\n请直接发送消息继续对话。",
+        parse_mode="HTML"
+    )
 
 
 # Action handlers

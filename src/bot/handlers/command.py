@@ -10,14 +10,14 @@ import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from ...claude.facade import ClaudeIntegration
+from ...utils.shell_utils import split_shell_args, extract_command_args, validate_shell_args
 from ...config.settings import Settings
+from ...claude.facade import ClaudeIntegration
 from ...projects import PrivateTopicsUnavailableError, load_project_registry
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ...storage.models import SessionModel
 from ..utils.html_format import escape_html
-
 logger = structlog.get_logger()
 
 
@@ -920,6 +920,18 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         status_lines.append(resumable_info)
         status_lines.append("💡 Session will auto-resume on your next message")
 
+    # Add recent messages preview
+    check_session_id = claude_session_id or (existing.session_id if 'existing' in locals() and existing else None)
+    if check_session_id:
+        recent_msgs = _get_session_recent_messages(check_session_id, n=2)
+        if recent_msgs:
+            status_lines.append("\n💬 <b>最近进度:</b>")
+            for role, text in recent_msgs:
+                icon = "👤" if role == "user" else "🤖"
+                preview = text[:150] + "..." if len(text) > 150 else text
+                status_lines.append(f"{icon} <i>{escape_html(preview)}</i>")
+
+
     # Add action buttons
     keyboard = []
     if claude_session_id:
@@ -1230,6 +1242,469 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         await update.message.reply_text(f"❌ <b>Git Error</b>\n\n{str(e)}")
         logger.error("Error in git_command", error=str(e), user_id=user_id)
+
+
+def _read_skills_from_dir(skills_dir: Path, is_skills_root: bool = False) -> list:
+    """Read skill definitions from a directory.
+    
+    If is_skills_root is True, scans subdirectories for SKILL.md (e.g. ~/.claude/skills/).
+    Otherwise, scans for .md files directly (e.g. ~/.claude/commands/).
+    """
+    import re
+    skills = []
+    if not skills_dir.exists():
+        return skills
+        
+    candidates = []
+    if is_skills_root:
+        for subdir in sorted(skills_dir.iterdir()):
+            if subdir.is_dir() and not subdir.name.startswith("."):
+                mds = list(subdir.glob("SKILL.md")) or list(subdir.glob("*.md"))
+                if mds:
+                    candidates.append((subdir.name, mds[0]))
+    else:
+        for md in sorted(skills_dir.glob("*.md")):
+            candidates.append((md.stem, md))
+
+    for name, md_path in candidates:
+        try:
+            content = md_path.read_text(encoding="utf-8")
+        except Exception:
+            skills.append((name, ""))
+            continue
+            
+        # Try YAML frontmatter description first
+        fm_match = re.match(r"^---\s*\n.*?description:\s*(.+?)\s*\n.*?---", content, re.DOTALL)
+        if fm_match:
+            desc = fm_match.group(1).strip()
+        else:
+            # Fall back to first non-empty line after the h1 title
+            lines = content.splitlines()
+            desc = ""
+            past_title = False
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    past_title = True
+                    continue
+                if past_title and stripped:
+                    desc = stripped[:60]
+                    break
+        skills.append((name, desc))
+    return skills
+
+
+async def skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List available Claude skills with clickable buttons."""
+    settings: Settings = context.bot_data["settings"]
+    
+    global_dir = Path.home() / ".claude" / "commands"
+    project_dir = settings.approved_directory / ".claude" / "commands"
+    current_dir = context.user_data.get("current_directory") or settings.approved_directory
+    current_project_dir = Path(current_dir) / ".claude" / "commands"
+    claude_skills_dir = Path.home() / ".claude" / "skills"
+
+    global_skills = _read_skills_from_dir(global_dir)
+    project_skills = _read_skills_from_dir(project_dir)
+    if current_project_dir != project_dir:
+        project_skills += _read_skills_from_dir(current_project_dir)
+        
+    # Read ~/.claude/skills (Antigravity style)
+    ag_skills = _read_skills_from_dir(claude_skills_dir, is_skills_root=True)
+
+    seen = set()
+    all_skills = []
+    for name, desc in project_skills + global_skills + ag_skills:
+        if name not in seen:
+            seen.add(name)
+            all_skills.append((name, desc))
+
+    all_skills.sort(key=lambda x: x[0])
+
+
+    if not all_skills:
+        await update.message.reply_text(
+            "ℹ️ <b>没有发现可用的 Skill</b>\n\n"
+            "请在以下目录添加 <code>.md</code> 文件：\n"
+            "• 全局：<code>~/.claude/commands/</code>\n"
+            "• 项目：<code>.claude/commands/</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # Build inline keyboard: 每个 skill 一行，点击后填入输入框 !skill-name 
+    rows = []
+    for name, desc in all_skills:
+        label = f"/{name}"
+        if desc:
+            label += f"  —  {desc[:35]}{'…' if len(desc) > 35 else ''}"
+        rows.append([
+            InlineKeyboardButton(
+                text=label,
+                # Pre-fill input box with "!skill-name " without sending
+                switch_inline_query_current_chat=f"!{name} ",
+            )
+        ])
+
+    lines = [f"🛠️ <b>可用 Skills ({len(all_skills)})</b>\n"]
+    for name, desc in all_skills:
+        desc_text = f"  <i>{escape_html(desc[:60])}</i>" if desc else ""
+        lines.append(f"• <code>!{escape_html(name)}</code>{desc_text}")
+    lines.append("\n点击按钮自动填入输入框，可在末尾追加内容后发送：")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+
+def _get_session_recent_messages(session_id: str, n: int = 3) -> list:
+    """Read the last N messages from a Claude CLI session JSONL file.
+    
+    Returns a list of (role, text) tuples sorted oldest-first.
+    """
+    import os, json, glob
+    projects_dir = os.path.expanduser('~/.claude/projects')
+    if not os.path.exists(projects_dir):
+        return []
+    
+    matches = glob.glob(os.path.join(projects_dir, '*', f'{session_id}.jsonl'))
+    if not matches:
+        return []
+    
+    path = matches[0]
+    messages = []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    msg = data.get('message', {})
+                    if not isinstance(msg, dict):
+                        continue
+                    role = msg.get('role')
+                    if role not in ('user', 'assistant'):
+                        continue
+                    content = msg.get('content', '')
+                    if isinstance(content, list):
+                        text_parts = []
+                        for c in content:
+                            if isinstance(c, dict) and c.get('type') == 'text':
+                                text_parts.append(c['text'])
+                        content = ' '.join(text_parts)
+                    if isinstance(content, str) and content.strip():
+                        messages.append((role, content.strip()))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    
+    return messages[-n:]
+
+
+async def _get_local_cli_sessions(project_path: Path) -> list:
+
+    """Read local Claude CLI history for the given project path."""
+    import os
+    import json
+    from datetime import datetime, UTC
+
+    sessions_map = {}
+    history_file = os.path.expanduser('~/.claude/history.jsonl')
+    
+    if not os.path.exists(history_file):
+        return []
+
+    project_str = str(project_path).replace('\\', '/').lower()
+    
+    try:
+        with open(history_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                    proj = entry.get('project', '').replace('\\', '/').lower()
+                    
+                    if proj == project_str or proj.startswith(project_str):
+                        sid = entry.get('sessionId')
+                        if not sid: 
+                            continue
+                            
+                        # Use display or prompt, whichever is available
+                        # The first entry we see for a sid will be the original prompt (oldest)
+                        # Actually wait, the file is append-only, so the first line we see for a sid is the oldest.
+                        # We want the oldest text as the name.
+                        text = entry.get('display') or entry.get('prompt') or 'Empty Session'
+                        if isinstance(text, str):
+                            text = text.replace('\n', ' ').strip()
+                            if len(text) > 20: text = text[:19] + '…'
+                        else:
+                            text = 'Empty Session'
+                            
+                        ts_ms = entry.get('timestamp', 0)
+                        ts = ts_ms / 1000.0 if ts_ms > 0 else 0
+                        
+                        if sid not in sessions_map:
+                            sessions_map[sid] = {
+                                "session_id": sid,
+                                "session_name": text,
+                                "last_used": datetime.fromtimestamp(ts, UTC) if ts > 0 else None,
+                                "message_count": 1,
+                                "is_cli": True
+                            }
+                        else:
+                            sessions_map[sid]["message_count"] += 1
+                            if ts > 0:
+                                current_ts = sessions_map[sid]["last_used"].timestamp() if sessions_map[sid]["last_used"] else 0
+                                if ts > current_ts:
+                                    sessions_map[sid]["last_used"] = datetime.fromtimestamp(ts, UTC)
+                except Exception:
+                    continue
+
+        # Check for renamed sessions (custom-title)
+        projects_dir = os.path.expanduser('~/.claude/projects')
+        import glob
+        if os.path.exists(projects_dir):
+            for sid in sessions_map.keys():
+                for f in glob.glob(os.path.join(projects_dir, '*', f'{sid}.jsonl')):
+                    try:
+                        with open(f, 'r', encoding='utf-8') as cf:
+                            for c_line in cf:
+                                if 'custom-title' in c_line:
+                                    try:
+                                        c_entry = json.loads(c_line)
+                                        if c_entry.get('type') == 'custom-title' and c_entry.get('customTitle'):
+                                            sessions_map[sid]["session_name"] = c_entry.get('customTitle')
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+        
+    except Exception as e:
+        pass
+        
+    return list(sessions_map.values())
+
+async def cc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /cc command to pass raw arguments to Claude SDK."""
+    user_id = update.effective_user.id
+    settings: Settings = context.bot_data["settings"]
+    claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+
+    if not claude_integration:
+        await update.message.reply_text("❌ <b>Claude Integration Not Available</b>", parse_mode="HTML")
+        return
+
+    import argparse
+    import shlex
+    import re
+    
+    def _split_shell_args(text: str) -> list:
+        try:
+            return shlex.split(text)
+        except ValueError:
+            return text.split()
+
+    text = update.message.text or ""
+    match = re.match(r"^/cc(?:@\w+)?\s+", text)
+    args_text = text[match.end():].strip() if match else ""
+
+    if not args_text:
+        await update.message.reply_text("用法：/cc <claude 参数>")
+        if audit_logger:
+            await audit_logger.log_security_event(
+                user_id=user_id,
+                event_type="cc_rejected",
+                event_data={"reason": "empty_args", "args_len": 0, "snippet": ""},
+                success=False,
+            )
+        return
+
+    if len(args_text) > 2000:
+        await update.message.reply_text("参数过长（最大 2000 字符）")
+        if audit_logger:
+            await audit_logger.log_security_event(
+                user_id=user_id,
+                event_type="cc_rejected",
+                event_data={"reason": "too_long", "args_len": len(args_text), "snippet": args_text[:200]},
+                success=False,
+            )
+        return
+
+    if any(token.startswith("--dangerously") for token in _split_shell_args(args_text)):
+        await update.message.reply_text("参数包含危险标记（--dangerously*）")
+        if audit_logger:
+            await audit_logger.log_security_event(
+                user_id=user_id,
+                event_type="cc_rejected",
+                event_data={"reason": "dangerous_flag", "args_len": len(args_text), "snippet": args_text[:200]},
+                success=False,
+            )
+        return
+
+    parser = argparse.ArgumentParser(prog="/cc", add_help=False)
+    parser.add_argument("-r", "--resume", nargs="?", const="last", default=None)
+    parser.add_argument("-p", "--print", action="store_true")
+    parser.add_argument("prompt_args", nargs=argparse.REMAINDER)
+
+    try:
+        parsed_args, unknown = parser.parse_known_args(_split_shell_args(args_text))
+    except (SystemExit, ValueError):
+        await update.message.reply_text("参数解析失败，请检查语法。")
+        return
+
+    session_id_override = None
+    if parsed_args.resume and parsed_args.resume != "last":
+        session_id_override = parsed_args.resume
+
+    if session_id_override:
+        context.user_data["force_new_session"] = False
+
+    prompt_parts = []
+    for token in unknown:
+        if not token.startswith("-"):
+            prompt_parts.append(token)
+    prompt_parts.extend(parsed_args.prompt_args)
+    from pathlib import Path
+    
+    project_root = None
+    if settings.enable_project_threads:
+        thread_context = context.user_data.get("_thread_context")
+        if thread_context and "project_root" in thread_context:
+            project_root = Path(thread_context["project_root"]).resolve()
+
+    current_dir = context.user_data.get("current_directory")
+    if current_dir:
+        # Check if it's valid within the project root
+        if project_root:
+            try:
+                current_dir.resolve().relative_to(project_root)
+            except ValueError:
+                current_dir = project_root
+    else:
+        current_dir = project_root if project_root else settings.approved_directory
+
+    if parsed_args.resume == "last" and not prompt_parts:
+        storage = context.bot_data.get("storage")
+        
+        # Aggregate bot sessions and local CLI sessions
+        combined_sessions = []
+        
+        if storage:
+            # Get bot database sessions
+            db_sessions = await storage.sessions.get_sessions_by_project(str(current_dir))
+            for s in db_sessions:
+                combined_sessions.append({
+                    "session_id": s.session_id,
+                    "session_name": getattr(s, "session_name", "") or s.session_id[:6],
+                    "last_used": getattr(s, "last_used", getattr(s, "created_at", None)),
+                    "message_count": getattr(s, "message_count", 0),
+                    "is_cli": False
+                })
+        
+        # Get local CLI transcripts
+        try:
+            cli_sessions = await _get_local_cli_sessions(current_dir)
+            combined_sessions.extend(cli_sessions)
+        except Exception as e:
+            logger.warning("Failed to load local CLI sessions", error=str(e))
+            
+        # Sort combined by last_used desc
+        combined_sessions.sort(key=lambda x: x["last_used"].timestamp() if x["last_used"] else 0, reverse=True)
+
+        if combined_sessions:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            keyboard = []
+            
+            if "session_names" not in context.user_data:
+                context.user_data["session_names"] = {}
+                
+            for s in combined_sessions[:10]:
+                date_ts = s["last_used"]
+                date_str = date_ts.astimezone().strftime("%m-%d %H:%M") if date_ts else "Unknown"
+                msgs = s["message_count"]
+                
+                full_name = s["session_name"] or ""
+                if full_name:
+                    full_name = full_name.replace("\n", " ").strip()
+                    if len(full_name) > 50:
+                        full_name = full_name[:49] + "…"
+                else:
+                    full_name = s["session_id"][:6]
+                    
+                context.user_data["session_names"][s["session_id"]] = full_name
+                
+                name = full_name
+                if len(name) > 15:
+                    name = name[:14] + "…"
+                    
+                icon = "💻" if s["is_cli"] else "📄"
+                btn_text = f"{icon} {name} ({date_str}, {msgs}条)"
+                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"resume:{s['session_id']}")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text("请选择要恢复的历史会话：", reply_markup=reply_markup)
+            return
+        else:
+            await update.message.reply_text("该目录下没有找到最近的活动会话。")
+            return
+
+    if not prompt_parts and parsed_args.resume:
+        prompt = "Please continue where we left off"
+    elif not prompt_parts:
+        prompt = "Hello"
+    else:
+        prompt = " ".join(prompt_parts)
+        if prompt.startswith(("'", '"')) and prompt.endswith(("'", '"')):
+            prompt = prompt[1:-1]
+
+    session_id = session_id_override or context.user_data.get("claude_session_id")
+
+    status_msg = await update.message.reply_text("🔄 <b>Processing</b>\n\nExecuting Claude command...", parse_mode="HTML")
+
+    try:
+        claude_response = await claude_integration.run_command(
+            prompt=prompt,
+            working_directory=current_dir,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+        context.user_data["claude_session_id"] = claude_response.session_id
+
+        await status_msg.delete()
+
+        from ..utils.formatting import ResponseFormatter
+        formatter = ResponseFormatter(settings)
+        formatted_messages = formatter.format_claude_response(claude_response.content)
+
+        for i, msg in enumerate(formatted_messages):
+            await update.message.reply_text(
+                msg.text,
+                parse_mode=msg.parse_mode,
+                reply_markup=msg.reply_markup,
+                reply_to_message_id=update.message.message_id if i == 0 else None,
+            )
+
+        if audit_logger:
+            await audit_logger.log_command(user_id=user_id, command="cc", args=[args_text[:100]], success=True)
+
+    except Exception as e:
+        error_msg = str(e)
+        logger.error("Error in cc command", error=error_msg, user_id=user_id)
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        
+        from ..handlers.message import _format_error_message
+        await update.message.reply_text(f"❌ <b>Error</b>\n\n{_format_error_message(e)}", parse_mode="HTML")
+        if audit_logger:
+            await audit_logger.log_command(user_id=user_id, command="cc", args=[args_text[:100]], success=False)
 
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

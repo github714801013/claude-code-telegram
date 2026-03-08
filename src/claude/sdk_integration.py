@@ -210,7 +210,7 @@ class ClaudeSDKManager:
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
                 system_prompt=base_prompt,
-                setting_sources=["project"],
+                setting_sources=["user", "project"],
                 stderr=_stderr_callback,
             )
 

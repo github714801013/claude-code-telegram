@@ -1,0 +1,15 @@
+projects:
+  - slug: claude-code-telegram
+    name: Claude Code Telegram
+    path: python/claude-code-telegram
+    enabled: true
+
+  - slug: auto-transfer
+    name: Auto Transfer
+    path: python/autoTransfer
+    enabled: true
+
+  - slug: oa-after
+    name: OA After (Java)
+    path: java/9ji/oa-after
+    enabled: true

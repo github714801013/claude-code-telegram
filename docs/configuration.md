@@ -68,7 +68,7 @@ ANTHROPIC_API_KEY=sk-ant-api03-...    # Optional: API key for SDK (uses CLI auth
 CLAUDE_MAX_TURNS=10
 
 # Timeout for Claude operations in seconds
-CLAUDE_TIMEOUT_SECONDS=300
+CLAUDE_TIMEOUT_SECONDS=3600
 
 # Maximum cost per user in USD (lifetime budget for rate limiter)
 CLAUDE_MAX_COST_PER_USER=10.0
