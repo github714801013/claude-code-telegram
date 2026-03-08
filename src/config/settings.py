@@ -117,7 +117,7 @@ class Settings(BaseSettings):
         description="List of allowed Claude tools",
     )
     claude_disallowed_tools: Optional[List[str]] = Field(
-        default=[],
+        default=["AskUserQuestion", "ask", "ask_user", "PromptUser"],
         description="List of explicitly disallowed Claude tools/commands",
     )
 

@@ -53,6 +53,7 @@ class ClaudeResponse:
     is_error: bool = False
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
+    history_context: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -121,6 +122,13 @@ def _make_can_use_tool_callback(
                         message=error or "Bash directory boundary violation"
                     )
 
+        # Deny interactive prompt tools since Claude SDK has no stdin attached via Telegram
+        if tool_name in ("AskUserQuestion", "ask_user", "ask", "PromptUser"):
+            return PermissionResultDeny(
+                message="[SYSTEM]: This environment is non-interactive Telegram. You CANNOT use interactive prompt tools. If you need user input or confirmation, simply output your question as a normal conversational text message and STOP your execution. The user will read it and reply in the next turn.",
+                interrupt=True
+            )
+
         return PermissionResultAllow()
 
     return can_use_tool
@@ -175,7 +183,11 @@ class ClaudeSDKManager:
             # Build system prompt, loading CLAUDE.md from working directory if present
             base_prompt = (
                 f"All file operations must stay within {working_directory}. "
-                "Use relative paths."
+                "Use relative paths.\n\n"
+                "SYSTEM WARNING: You are running inside a Telegram bot without a terminal. "
+                "DO NOT use tools like `AskUserQuestion`, `ask`, or any tool that prompts for user input or confirmation. "
+                "If you need to ask a question or request confirmation, simply OUTPUT YOUR QUESTION IN PLAIN TEXT and STOP execution. "
+                "The user will read your text message in Telegram and reply natively."
             )
             claude_md_path = Path(working_directory) / "CLAUDE.md"
             if claude_md_path.exists():
@@ -209,6 +221,7 @@ class ClaudeSDKManager:
                     "autoAllowBashIfSandboxed": True,
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
+                permission_mode="bypassPermissions",
                 system_prompt=base_prompt,
                 setting_sources=["user", "project"],
                 stderr=_stderr_callback,
@@ -363,6 +376,29 @@ class ClaudeSDKManager:
                         elif msg_content:
                             content_parts.append(str(msg_content))
                 content = "\n".join(content_parts)
+
+            # Build recent history context for empty responses
+            history_context = []
+            for msg in messages[-10:]: # Look at recent messages
+                if isinstance(msg, UserMessage):
+                    history_context.append(f"👤 You: {getattr(msg, 'content', '')}")
+                elif isinstance(msg, AssistantMessage):
+                    msg_content = getattr(msg, "content", [])
+                    text_parts = []
+                    if isinstance(msg_content, list):
+                        for block in msg_content:
+                            if hasattr(block, "text"):
+                                text_parts.append(block.text)
+                            elif isinstance(block, ToolUseBlock):
+                                text_parts.append(f"🔧 [Tool: {getattr(block, 'name', 'unknown')}]")
+                    elif msg_content:
+                        text_parts.append(str(msg_content))
+                    
+                    if text_parts:
+                        history_context.append(f"🤖 Claude: {' '.join(text_parts)}")
+                        
+            # Keep only the last 5 turns
+            history_context = history_context[-5:]
 
             return ClaudeResponse(
                 content=content,

@@ -1121,13 +1121,9 @@ class MessageOrchestrator:
 
             response_text = claude_response.content
             if not response_text or not str(response_text).strip():
-                try:
-                    from .handlers.command import _get_session_recent_messages
-                    recent_msgs = _get_session_recent_messages(claude_response.session_id, n=5)
-                    if recent_msgs:
-                        response_text = "<i>(由于内容为空，显示最近 5 条会话记录)</i>\n\n" + "\n\n".join(recent_msgs)
-                except Exception:
-                    pass
+                if getattr(claude_response, "history_context", None):
+                    recent_msgs = claude_response.history_context
+                    response_text = "<i>(由于内容为空，显示最近的会话记录)</i>\n\n" + "\n\n".join(recent_msgs)
 
             formatted_messages = formatter.format_claude_response(
                 response_text
